@@ -1,5 +1,7 @@
 import asyncio
 import io
+import os
+import struct
 
 import edge_tts
 from fastapi import FastAPI, HTTPException, Query
@@ -59,11 +61,58 @@ def generate_google_audio(text: str, lang: str) -> bytes:
     return buf.getvalue()
 
 
+# ---------- ENGINE: Google Gemini TTS (real AI character voices) ----------
+def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000, channels: int = 1, bits_per_sample: int = 16) -> bytes:
+    """Gemini TTS returns raw PCM audio — wrap it in a WAV header so browsers can play it."""
+    byte_rate = sample_rate * channels * bits_per_sample // 8
+    block_align = channels * bits_per_sample // 8
+    data_size = len(pcm_bytes)
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + data_size, b"WAVE",
+        b"fmt ", 16, 1, channels, sample_rate, byte_rate, block_align, bits_per_sample,
+        b"data", data_size,
+    )
+    return header + pcm_bytes
+
+
+def generate_gemini_audio(text: str, voice: str) -> bytes:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is not set on the server.")
+
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash-preview-tts",
+        contents=text,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+                )
+            ),
+        ),
+    )
+    pcm_data = response.candidates[0].content.parts[0].inline_data.data
+    return _pcm_to_wav(pcm_data)
+
+
+def engine_mime_type(engine: str) -> str:
+    return "audio/wav" if engine == "gemini" else "audio/mpeg"
+
+
 async def generate_audio(text: str, voice: str, rate: str, pitch: str, engine: str, max_retries: int = 3) -> bytes:
     if engine == "google":
         lang = voice.split("-")[0] if "-" in voice else voice
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, generate_google_audio, text, lang)
+    if engine == "gemini":
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, generate_gemini_audio, text, voice)
     return await generate_edge_audio(text, voice, rate, pitch, max_retries=max_retries)
 
 
@@ -111,15 +160,17 @@ async def speak(
     except edge_tts.exceptions.NoAudioReceived:
         raise HTTPException(
             status_code=502,
-            detail="Microsoft TTS server se audio nahi mila, dobara try karein (ya 'Google' engine try karein).",
+            detail="Microsoft TTS server se audio nahi mila, dobara try karein (ya 'Google'/'Gemini' engine try karein).",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
 
+    mime = engine_mime_type(engine)
+    ext = "wav" if engine == "gemini" else "mp3"
     return StreamingResponse(
         io.BytesIO(audio_bytes),
-        media_type="audio/mpeg",
-        headers={"Content-Disposition": "inline; filename=speech.mp3"},
+        media_type=mime,
+        headers={"Content-Disposition": f"inline; filename=speech.{ext}"},
     )
 
 
@@ -135,8 +186,10 @@ async def preview(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Preview failed: {str(e)}")
 
+    mime = engine_mime_type(engine)
+    ext = "wav" if engine == "gemini" else "mp3"
     return StreamingResponse(
         io.BytesIO(audio_bytes),
-        media_type="audio/mpeg",
-        headers={"Content-Disposition": "inline; filename=preview.mp3"},
+        media_type=mime,
+        headers={"Content-Disposition": f"inline; filename=preview.{ext}"},
     )
