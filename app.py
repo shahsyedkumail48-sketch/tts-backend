@@ -1,12 +1,13 @@
-from fastapi import FastAPI, Query
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-import edge_tts
+import asyncio
 import io
+
+import edge_tts
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 app = FastAPI()
 
-# Allow requests from any website (so your HTML page hosted anywhere can call this)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,32 +17,63 @@ app.add_middleware(
 
 
 @app.get("/")
-def home():
+def root():
     return {"status": "ok", "message": "Edge TTS backend is running"}
 
 
-@app.get("/voices")
-async def list_voices():
-    voices = await edge_tts.list_voices()
-    return [
-        {"name": v["ShortName"], "gender": v["Gender"], "locale": v["Locale"]}
-        for v in voices
-    ]
+async def generate_audio(text: str, voice: str, rate: str, pitch: str, max_retries: int = 3) -> bytes:
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+            audio_buffer = io.BytesIO()
+            got_audio = False
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_buffer.write(chunk["data"])
+                    got_audio = True
+
+            if got_audio and audio_buffer.tell() > 0:
+                return audio_buffer.getvalue()
+
+            # No audio received this attempt — treat as failure and retry
+            raise edge_tts.exceptions.NoAudioReceived(
+                "No audio was received. Please verify that your parameters are correct."
+            )
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                # small backoff before retrying
+                await asyncio.sleep(0.7 * attempt)
+                continue
+            break
+
+    raise last_error
 
 
 @app.get("/speak")
 async def speak(
-    text: str = Query(..., description="Text to convert to speech"),
-    voice: str = Query("en-US-JennyNeural", description="Voice name"),
-    rate: str = Query("+0%", description="Speech rate, e.g. +10%, -20%"),
-    pitch: str = Query("+0Hz", description="Pitch, e.g. +5Hz, -10Hz"),
+    text: str = Query(...),
+    voice: str = Query("en-US-AriaNeural"),
+    rate: str = Query("+0%"),
+    pitch: str = Query("+0Hz"),
 ):
-    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
 
-    audio_buffer = io.BytesIO()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            audio_buffer.write(chunk["data"])
+    try:
+        audio_bytes = await generate_audio(text, voice, rate, pitch)
+    except edge_tts.exceptions.NoAudioReceived:
+        raise HTTPException(
+            status_code=502,
+            detail="Microsoft TTS server se audio nahi mila, dobara try karein (ho sakta hai sirf is waqt server busy ho).",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
 
-    audio_buffer.seek(0)
-    return StreamingResponse(audio_buffer, media_type="audio/mpeg")
+    return StreamingResponse(
+        io.BytesIO(audio_bytes),
+        media_type="audio/mpeg",
+        headers={"Content-Disposition": "inline; filename=speech.mp3"},
+    )
