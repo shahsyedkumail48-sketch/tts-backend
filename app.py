@@ -18,6 +18,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- EXPRESSION / MOOD PRESETS ----------
+# rate/pitch overrides apply to Edge TTS; gemini_style is a natural-language
+# instruction prepended to the text for Gemini TTS (which understands tone/emotion directly).
+EXPRESSION_PRESETS = {
+    "normal":  {"rate": 0,   "pitch": 0,   "gemini_style": None},
+    "chill":   {"rate": -15, "pitch": -5,  "gemini_style": "Say in a calm, relaxed, laid-back tone:"},
+    "fast":    {"rate": 35,  "pitch": 0,   "gemini_style": "Say quickly, in a fast-paced and energetic tone:"},
+    "slow":    {"rate": -30, "pitch": 0,   "gemini_style": "Say slowly and deliberately, in a calm tone:"},
+    "excited": {"rate": 20,  "pitch": 15,  "gemini_style": "Say in an excited, enthusiastic, upbeat tone:"},
+    "sad":     {"rate": -10, "pitch": -12, "gemini_style": "Say in a sad, somber, melancholic tone:"},
+    "whisper": {"rate": -10, "pitch": -5,  "gemini_style": "Whisper softly and gently:"},
+    "angry":   {"rate": 10,  "pitch": 12,  "gemini_style": "Say in an angry, intense, forceful tone:"},
+    "dramatic":{"rate": -5,  "pitch": 8,   "gemini_style": "Say in a dramatic, theatrical, suspenseful tone:"},
+}
+
 
 @app.get("/")
 def root():
@@ -76,7 +91,7 @@ def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000, channels: int = 1, b
     return header + pcm_bytes
 
 
-def generate_gemini_audio(text: str, voice: str) -> bytes:
+def generate_gemini_audio(text: str, voice: str, style: str = "normal") -> bytes:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY environment variable is not set on the server.")
@@ -84,10 +99,14 @@ def generate_gemini_audio(text: str, voice: str) -> bytes:
     from google import genai
     from google.genai import types
 
+    preset = EXPRESSION_PRESETS.get(style, EXPRESSION_PRESETS["normal"])
+    gemini_style = preset.get("gemini_style")
+    final_text = f"{gemini_style} {text}" if gemini_style else text
+
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model="gemini-2.5-flash-preview-tts",
-        contents=text,
+        contents=final_text,
         config=types.GenerateContentConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
@@ -105,14 +124,21 @@ def engine_mime_type(engine: str) -> str:
     return "audio/wav" if engine == "gemini" else "audio/mpeg"
 
 
-async def generate_audio(text: str, voice: str, rate: str, pitch: str, engine: str, max_retries: int = 3) -> bytes:
+async def generate_audio(text: str, voice: str, rate: str, pitch: str, engine: str, style: str = "normal", max_retries: int = 3) -> bytes:
+    preset = EXPRESSION_PRESETS.get(style, EXPRESSION_PRESETS["normal"])
+
     if engine == "google":
         lang = voice.split("-")[0] if "-" in voice else voice
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, generate_google_audio, text, lang)
     if engine == "gemini":
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, generate_gemini_audio, text, voice)
+        return await loop.run_in_executor(None, generate_gemini_audio, text, voice, style)
+
+    # Edge TTS: if an expression preset is chosen (not "normal"), it overrides the manual rate/pitch sliders
+    if style != "normal":
+        rate = f"{'+' if preset['rate'] >= 0 else ''}{preset['rate']}%"
+        pitch = f"{'+' if preset['pitch'] >= 0 else ''}{preset['pitch']}Hz"
     return await generate_edge_audio(text, voice, rate, pitch, max_retries=max_retries)
 
 
@@ -133,10 +159,17 @@ async def test_voices(voices: str = Query(...), engine: str = Query("edge")):
         except Exception:
             results[v] = "broken"
 
-    batch_size = 5
-    for i in range(0, len(voice_list), batch_size):
-        batch = voice_list[i : i + batch_size]
-        await asyncio.gather(*(check_one(v) for v in batch))
+    if engine == "gemini":
+        # Gemini's free tier has strict per-minute rate limits — go one at a time
+        # with a small gap so the check doesn't trigger a false "all broken" result.
+        for v in voice_list:
+            await check_one(v)
+            await asyncio.sleep(2.0)
+    else:
+        batch_size = 5
+        for i in range(0, len(voice_list), batch_size):
+            batch = voice_list[i : i + batch_size]
+            await asyncio.gather(*(check_one(v) for v in batch))
 
     working = [v for v, s in results.items() if s == "working"]
     broken = [v for v, s in results.items() if s == "broken"]
@@ -149,14 +182,15 @@ async def speak(
     voice: str = Query("en-US-AriaNeural"),
     rate: str = Query("+0%"),
     pitch: str = Query("+0Hz"),
-    engine: str = Query("edge", description="edge or google"),
+    engine: str = Query("edge", description="edge, google, or gemini"),
+    style: str = Query("normal", description="normal, chill, fast, slow, excited, sad, whisper, angry, dramatic"),
 ):
     text = text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
     try:
-        audio_bytes = await generate_audio(text, voice, rate, pitch, engine)
+        audio_bytes = await generate_audio(text, voice, rate, pitch, engine, style=style)
     except edge_tts.exceptions.NoAudioReceived:
         raise HTTPException(
             status_code=502,
@@ -178,11 +212,12 @@ async def speak(
 async def preview(
     voice: str = Query(...),
     engine: str = Query("edge"),
+    style: str = Query("normal"),
 ):
     """Short fixed sample so users can hear what a voice sounds like before using it."""
     sample_text = "This is a quick preview of this voice."
     try:
-        audio_bytes = await generate_audio(sample_text, voice, "+0%", "+0Hz", engine, max_retries=2)
+        audio_bytes = await generate_audio(sample_text, voice, "+0%", "+0Hz", engine, style=style, max_retries=2)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Preview failed: {str(e)}")
 
