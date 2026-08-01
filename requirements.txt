@@ -3,4 +3,4 @@ uvicorn==0.30.6
 edge-tts>=6.1.19
 supabase>=2.0.0
 python-dotenv>=1.0.0
-gTTS' 
+gTTS
