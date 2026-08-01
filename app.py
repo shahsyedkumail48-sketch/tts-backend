@@ -5,6 +5,7 @@ import edge_tts
 import io
 import asyncio
 import os
+from gtts import gTTS
 from supabase import create_client, Client
 
 app = FastAPI()
@@ -12,10 +13,8 @@ app = FastAPI()
 # Supabase setup
 SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://bkjggmanvcjcsjevqglo.supabase.co')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
-
 if not SUPABASE_SERVICE_KEY:
     print("WARNING: SUPABASE_SERVICE_ROLE_KEY not set!")
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # Allow requests from any website
@@ -26,11 +25,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "Edge TTS backend is running"}
-
+    return {"status": "ok", "message": "TTS backend is running"}
 
 @app.get("/voices")
 async def list_voices():
@@ -39,7 +36,6 @@ async def list_voices():
         {"name": v["ShortName"], "gender": v["Gender"], "locale": v["Locale"]}
         for v in voices
     ]
-
 
 async def synthesize_with_retry(text, voice, rate, pitch, max_retries=3):
     last_error = None
@@ -60,9 +56,22 @@ async def synthesize_with_retry(text, voice, rate, pitch, max_retries=3):
             last_error = e
             if attempt < max_retries - 1:
                 await asyncio.sleep(1)  # wait a bit before retrying
-            continue
-    raise last_error
+                continue
+            raise last_error
 
+def _generate_google_tts(text, lang):
+    """Runs in a background thread since gTTS is blocking/synchronous."""
+    buf = io.BytesIO()
+    tts = gTTS(text=text, lang=lang)
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    return buf
+
+async def synthesize_google(text, voice):
+    # voice looks like "ur-PK-AsadNeural" -> take just the language part "ur"
+    lang = (voice or "en").split("-")[0].lower()
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _generate_google_tts, text, lang)
 
 @app.get("/speak")
 async def speak(
@@ -70,39 +79,43 @@ async def speak(
     voice: str = Query("en-US-JennyNeural", description="Voice name"),
     rate: str = Query("+0%", description="Speech rate, e.g. +10%, -20%"),
     pitch: str = Query("+0Hz", description="Pitch, e.g. +5Hz, -10Hz"),
+    engine: str = Query("edge", description="TTS engine: edge or google"),
+    style: str = Query("normal", description="Expression/mood (reserved for future use)"),
     user_id: str = Query(None, description="User ID for credit deduction"),
 ):
     try:
-        # Generate audio
-        audio_buffer = await synthesize_with_retry(text, voice, rate, pitch)
-        
+        # Generate audio using the requested engine
+        if engine == "google":
+            audio_buffer = await synthesize_google(text, voice)
+        else:
+            audio_buffer = await synthesize_with_retry(text, voice, rate, pitch)
+
         # Deduct credits if user_id provided
         if user_id and SUPABASE_SERVICE_KEY:
             try:
                 # Calculate credits to deduct (1 credit per character, minimum 1)
                 char_count = len(text.strip())
                 credits_to_deduct = max(1, char_count)
-                
+
                 # Get user's current credits
                 user_data = supabase.table("profiles").select("credits").eq("id", user_id).single().execute()
                 current_credits = user_data.data.get("credits", 0) if user_data.data else 0
-                
+
                 # Check if user has enough credits
                 if current_credits < credits_to_deduct:
                     return JSONResponse(
                         status_code=402,
                         content={"error": "Insufficient credits", "required": credits_to_deduct, "available": current_credits},
                     )
-                
+
                 # Deduct credits
                 new_credits = current_credits - credits_to_deduct
                 supabase.table("profiles").update({"credits": new_credits}).eq("id", user_id).execute()
-                
             except Exception as credit_error:
                 print(f"Credit deduction error: {credit_error}")
                 # Don't fail the request if credit deduction fails
                 pass
-        
+
         return StreamingResponse(audio_buffer, media_type="audio/mpeg")
     except Exception as e:
         return JSONResponse(
